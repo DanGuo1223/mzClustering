@@ -1,7 +1,26 @@
+import numpy as np
+import warnings
+from sklearn import metrics
+
+def clustering_acc(y_true, y_pred):
+    y_true = y_true.astype(np.int64)
+    assert y_pred.size == y_true.size
+    D = max(y_pred.max(), y_true.max()) + 1
+    w = np.zeros((D, D), dtype=np.int64)
+    for i in range(y_pred.size):
+        w[y_pred[i], y_true[i]] += 1
+    ind = linear_assignment(w.max() - w)
+
+    return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
+def NMI(y_true, y_pred):
+    return metrics.normalized_mutual_info_score(y_true, y_pred)
+def ARI(y_true, y_pred):
+    return metrics.adjusted_rand_score(y_true, y_pred)
+
 """
+Import linear_assignment function
 Solve the unique lowest-cost assignment problem using the
 Hungarian algorithm (also known as Munkres algorithm).
-
 """
 # Based on original code by Brain Clapper, adapted to NumPy by Gael Varoquaux.
 # Heavily refactored by Lars Buitinck.
@@ -10,50 +29,29 @@ Hungarian algorithm (also known as Munkres algorithm).
 # Author: Brian M. Clapper, Gael Varoquaux
 # LICENSE: BSD
 
-import numpy as np
-import warnings
-
-
-# Deprecation warning for module
-warnings.warn(
-    "The linear_assignment_ module is deprecated in 0.21 "
-    "and will be removed from 0.23. Use "
-    "scipy.optimize.linear_sum_assignment instead.",
-    FutureWarning)
-
-
 def linear_assignment(X):
     """Solve the linear assignment problem using the Hungarian algorithm.
-
     The problem is also known as maximum weight matching in bipartite graphs.
     The method is also known as the Munkres or Kuhn-Munkres algorithm.
-
     Parameters
     ----------
     X : array
         The cost matrix of the bipartite graph
-
     Returns
     -------
     indices : array
         The pairs of (row, col) indices in the original array giving
         the original ordering.
-
     References
     ----------
-
     1. http://www.public.iastate.edu/~ddoty/HungarianAlgorithm.html
-
     2. Harold W. Kuhn. The Hungarian Method for the assignment problem.
        *Naval Research Logistics Quarterly*, 2:83-97, 1955.
-
     3. Harold W. Kuhn. Variants of the Hungarian method for assignment
        problems. *Naval Research Logistics Quarterly*, 3: 253-258, 1956.
-
     4. Munkres, J. Algorithms for the Assignment and Transportation Problems.
        *Journal of the Society of Industrial and Applied Mathematics*,
        5(1):32-38, March, 1957.
-
     5. https://en.wikipedia.org/wiki/Hungarian_algorithm
     """
     indices = _hungarian(X).tolist()
@@ -68,7 +66,6 @@ def linear_assignment(X):
 
 class _HungarianState:
     """State of one execution of the Hungarian algorithm.
-
     Parameters
     ----------
     cost_matrix : 2D matrix
@@ -106,15 +103,12 @@ class _HungarianState:
 
 def _hungarian(cost_matrix):
     """The Hungarian algorithm.
-
     Calculate the Munkres solution to the classical assignment problem and
     return the indices for the lowest-cost pairings.
-
     Parameters
     ----------
     cost_matrix : 2D matrix
         The cost matrix. Does not have to be square.
-
     Returns
     -------
     indices : 2D array of indices
