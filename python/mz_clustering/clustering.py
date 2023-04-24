@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,21 +7,55 @@ import numpy as np
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-
-from random import sample
+import matplotlib.pyplot as plt
+import random
 from sklearn import manifold
 from time import time
 from matplotlib import offsetbox
 import seaborn as sns
+from sklearn.cluster import KMeans
 
-import CAE
-import cnnClust
-import pseudo_labeling
+from CAE import CAE
+from cnnClust import cnnClust
+from pseudo_labeling import pseudo_labeling, K_nearst_neighbor
 from utils import clustering_acc, NMI, ARI
 
+def get_batch(train_image, train_label = None, batch_size = 128):
+    batch_data = dict()
+    sample_id = random.sample(range(len(train_image)), batch_size)
+
+    index = [[]]
+    index[0] = [x for x in range(batch_size)]
+    index.append(sample_id)
+
+    batch_data['image'] = train_image[sample_id,]
+
+    if train_label is not None:
+        batch_data['label'] = train_label[sample_id,]
+
+    batch_data['index'] = index
+
+    return batch_data
+
+
+def get_batch_sequential(train_image, train_label = None, batch_size = 128, i = 0):
+    batch_data = dict()
+
+    if i < len(train_image)//batch_size:
+        batch_data['image'] = train_image[(batch_size*i):(batch_size*(i+1)),:]
+        if train_label is not None:
+            batch_data['label'] = train_label[(batch_size*i):(batch_size*(i+1)),]
+    else:
+        batch_data['image'] = train_image[(batch_size*i):len(train_image),:]
+        if train_label is not None:
+                batch_data['label'] = train_label[(batch_size*i):len(train_image),]
+
+    return batch_data
+
 class clustering(object):
-    def __init__(self, spec_path, label_path = None, num_cluster = 7, height = 40, width = 40, lr = 0.0001, batch_size = 128, KNN = True, k = 10):
+    def __init__(self, spec_path, label_path = None, num_cluster = 7, height = 40, width = 40, lr = 0.0001, batch_size = 128, KNN = True, k = 10, random_seed = 6):
         super(clustering, self).__init__()
+
         self.spec_path = spec_path
         self.label_path = label_path
         self.num_cluster = num_cluster
@@ -30,71 +65,70 @@ class clustering(object):
         self.batch_size = batch_size
         self.KNN = KNN
         self.k = k
-        
-        self.spec = np.genfromtxt(self.spec_path,delimiter=' ')
+        self.random_seed = random_seed
+        torch.manual_seed(self.random_seed)
+        torch.backends.cudnn.deterministic = True
 
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+
+
+        self.spec = np.genfromtxt(self.spec_path, delimiter=' ')
         self.image_data = np.reshape(self.spec, (-1, self.height, self.width, 1))
-        
-        self.sampleN = len(self.image_data)
-        
+        self.sampleN = self.image_data.shape[0]
+        device = 'cuda'
+        self.cae = CAE(image_height = self.height, image_width = self.width, seed = self.random_seed).to(device)
+        self.CLUST = cnnClust(num_clust = self.num_cluster, image_height = self.height, image_width = self.width, seed = self.random_seed).to(device)
+
         if self.label_path:
             self.label = np.genfromtxt(self.label_path,delimiter=' ')
-
             self.image_label = np.asarray(self.label, dtype=np.int32)
+
         ### image normalization
+        print('min:', np.min(self.image_data[84,::]), 'max:', np.max(self.image_data[84,::]))
         for i in range(0, self.sampleN):
             current_min = np.min(self.image_data[i,::])
             current_max = np.max(self.image_data[i,::])
             self.image_data[i,::] = (current_max - self.image_data[i,::]) / (current_max - current_min)
-    
-    def get_batch(self, train_image, train_label, batch_size):
-        sample_id = sample(range(len(train_image)), batch_size)
-        index = [[]]
-        index[0] = [x for x in range(batch_size)]
-        index.append(sample_id)
-        batch_image = train_image[sample_id,]
-        batch_label = train_label[sample_id,]
-        return batch_image, batch_label, index
 
 
-    def get_batch_sequential(self, train_image, train_label, batch_size, i):
-        if i < len(train_image)//batch_size:
-            batch_image = train_image[(batch_size*i):(batch_size*(i+1)),:]
-            batch_label = train_label[(batch_size*i):(batch_size*(i+1))]
-        else:
-            batch_image = train_image[(batch_size*i):len(train_image),:]
-            batch_label = train_label[(batch_size*i):len(train_image)]
-        return batch_image, batch_label
+
+    def loss_func(self, x_p, x):
+
+        MSE = F.mse_loss(x_p, x, reduction = 'mean')
+
+        return MSE
+
     def train(self, use_gpu = True):
         device = torch.device("cuda" if use_gpu else "cpu")
-        
-        cae = CAE(train_mode = True).to(device)
-        CLUST = cnnClust(num_clust = self.num_cluster).to(device)
-        
-        model_params = list(cae.parameters()) + list(CLUST.parameters())
-        optimizer = torch.optim.RMSprop(params = model_params,lr = 0.001, weight_decay=0) #torch.optim.Adam(model_params, lr=lr)
+        results = dict()
 
-        u = 98 
-        l = 46 
-        loss_list = list()
+        model_params = list(self.cae.parameters()) + list(self.CLUST.parameters())
+        optimizer = torch.optim.RMSprop(params = model_params,lr = 0.001, weight_decay = 0)
 
-        random_seed = 1224
-        torch.manual_seed(random_seed)
-        torch.cuda.manual_seed(random_seed)
-        torch.backends.cudnn.deterministic = True
+        u = 98
+        l = 46
 
+
+        if self.KNN:
+            A = K_nearst_neighbor(data = self.image_data, dist = 'euclidean', K = self.k)
+        else:
+            A = None
+
+        self.cae.train()
+        self.CLUST.train()
         for epoch in range(0, 11):
             losses = list()
             for iter in range(501):
 
-                train_x, train_y, index = get_batch(self.image_data, self.image_label, self.batch_size)
+                batch_data = get_batch(self.image_data, self.image_label, self.batch_size)
 
-                train_x = torch.Tensor(train_x).to(device)
-                train_x = train_x.reshape((-1, 1, height, width))
+                train_x = torch.Tensor(batch_data['image']).to(device)
+                train_x = train_x.reshape((-1, 1, self.height, self.width))
+
                 optimizer.zero_grad()
-                x_p = cae(train_x)
-
-                loss = loss_func(x_p, train_x)
+                x_p, z = self.cae(train_x)
+                loss = self.loss_func(x_p, train_x)
                 loss.backward()
                 optimizer.step()
                 losses.append(loss.item())
@@ -102,114 +136,123 @@ class clustering(object):
             print('Train Epoch: {} Loss: {:.6f}'.format(
                       epoch + 1, sum(losses)/len(losses)))
 
-        optimizer = torch.optim.RMSprop(params = model_params,lr = 0.01, weight_decay=0.0)
+
+
+        losses_pos = list()
+        losses_neg = list()
+
+
         for epoch in range(0, 11):
 
-            losses = list()
-            losses2 = list()
+            for iter in range(2*(epoch + 1)): #31 #10*(epoch + 1)
 
-            train_x, train_y, index = get_batch(self.image_data, self.image_label, self.batch_size)
+                batch_data = get_batch(self.image_data, self.image_label, self.batch_size)
 
-
-            train_x = torch.Tensor(train_x).to(device)
-
-            train_x = train_x.reshape((-1, 1, height, width))
-
-
-
-
-            x_p = cae(train_x)
-            features = CLUST(x_p)
-            features = F.normalize(features, p = 2, dim = -1)
-            features = features / features.norm(dim=1)[:, None]
-            sim_mat = torch.matmul(features, torch.transpose(features, 0,1))
-
-
-
-
-            for iter in range(31):
-
-                train_x, train_y, index = get_batch(self.image_data, self.image_label, self.sampleN)
-
-
-                train_x = torch.Tensor(train_x).to(device)
-
-                train_x = train_x.reshape((-1, 1, height, width))
+                train_x = torch.Tensor(batch_data['image']).to(device)
+                train_x = train_x.reshape((-1, 1, self.height, self.width))
 
                 optimizer.zero_grad()
-                x_p = cae(train_x)
+                x_p,z = self.cae(train_x)
 
-                loss1 = loss_func(x_p, train_x)
+                loss1 = self.loss_func(x_p, train_x)
 
-                features = CLUST(x_p)
+                features = self.CLUST(x_p)
                 features = F.normalize(features, p = 2, dim = -1)
                 features = features / features.norm(dim=1)[:, None]
-                sim_mat = torch.matmul(features, torch.transpose(features, 0,1))
 
+
+
+                sim_mat = torch.matmul(features, torch.transpose(features, 0,1))
                 tmp = sim_mat.cpu().detach().numpy()
                 tmp2 = [tmp[i][j] for i in range(0,self.batch_size-1) for j in range(self.batch_size-1) if i!=j ]
                 ub = np.percentile(tmp2, u)
                 lb = np.percentile(tmp2, l)
-    
-                pos_loc, neg_loc = pseudo_labeling(features, ub, lb, index = index, KNN = True, A = A)
+
+                pos_loc, neg_loc = pseudo_labeling(sim_mat, ub, lb, KNN = self.KNN, A = A, index = batch_data['index'])
                 pos_entropy = torch.mul(-torch.log(torch.clip(sim_mat, 1e-10, 1)), pos_loc)
                 neg_entropy = torch.mul(-torch.log(torch.clip(1-sim_mat, 1e-10, 1)), neg_loc)
-
                 loss2 = pos_entropy.sum()/pos_loc.sum() + neg_entropy.sum()/neg_loc.sum()
 
                 loss = 1000*loss1 + loss2
-                losses.append(loss1.item())
-                losses2.append(loss2.item())
                 loss.backward()
                 optimizer.step()
-                loss_list.append(sum(losses)/len(losses))
+
+                losses_pos.append(pos_entropy.sum()/pos_loc.sum().item())
+                losses_neg.append(neg_entropy.sum()/neg_loc.sum().item())
 
 
+            pred_label = torch.argmax(features, dim = 1)
+            pred_label = pred_label.cpu().detach().numpy()
 
-
-
+            if 'label' in batch_data:
+                y =  batch_data['label']
+                acc = clustering_acc(y, pred_label)
+                nmi = NMI(y, pred_label)
+                ari = ARI(y, pred_label)
+                print('NMI, ARI, ACC at epoch %d is %f, %f, %f.' % (epoch, nmi, ari, acc))
 
             u = u - 1
             l = l + 4
-        return cae, CLUST
-    def inference(self, cae, CLUST)
+        results['cae_weights'], results['CLUST_weights'] = self.cae, self.CLUST
+        results['losses'] = list([losses_pos, losses_neg])
+        results['KNN_list'] = A
+        return results
+
+    def inference(self, use_gpu = True):
+        self.cae.eval()
+        self.CLUST.eval()
+        results = dict()
         with torch.no_grad():
-            pred_label = list()
-            for iter in range(len(self.image_data)//self.batch_size):
+            device = torch.device("cuda" if use_gpu else "cpu")
+            pred_labels = list()
 
-                train_x, train_y, _ = get_batch_sequential(self.image_data, self.image_label, self.sampleN, iter)
+            for iter in range(int(np.ceil(len(self.image_data)/self.batch_size))):
+
+                batch_data = get_batch_sequential(self.image_data, self.image_label, self.batch_size, iter)
+
+                train_x = torch.Tensor(batch_data['image']).to(device)
+
+                train_x = train_x.reshape((-1, 1, self.height, self.width))
+
+                x_p,z = self.cae(train_x)
+                raw_pred_label = self.CLUST(x_p)
+                pred_label = torch.argmax(raw_pred_label, dim = 1)
+                pred_labels.extend(pred_label.cpu().detach().numpy())
 
 
-                train_x = torch.Tensor(train_x).to(device)
-                train_x = train_x.reshape((-1, 1, height, width))
+            pred_labels = np.array(pred_labels)
 
-                x_p = cae(train_x)
-                psuedo_label = CLUST(x_p)
+            if 'label' in batch_data:
+                y = batch_data['label']
+                acc = clustering_acc(y, pred_labels)
+                nmi = NMI(y, pred_labels)
+                ari = ARI(y, pred_labels)
+                print('testing NMI, ARI, ACC is %f, %f, %f.' % (nmi, ari, acc))
+                results['nmi'], results['ari'], results['acc'] = nmi, ari, acc
+                results['pred_label'], results['pred_logits'] = pred_label, raw_pred_label
+        return results
 
-                psuedo_label = torch.argmax(psuedo_label, dim = 1)
-                pred_label.extend(psuedo_label.cpu().detach().numpy())
-
-            pred_label = np.array(pred_label)
-            acc = clustering_acc(train_y, pred_label)
-
-            nmi = NMI(image_label, pred_label)
-            ari = ARI(image_label, pred_label)
-            print('testing NMI, ARI, ACC at epoch %d is %f, %f, %f.' % (epoch, nmi, ari, acc))
-
-        return nmi, ari, acc, pred_label
     def tsne_viz(self, pred_label):
-        X = np.reshape(self.image_data, (-1, self.height*self.width))
+        device = torch.device("cuda")
+
+        batch_data = get_batch_sequential(self.image_data, self.image_label, self.sampleN, 0)
+        train_x = torch.Tensor(batch_data['image']).to(device)
+        train_x = train_x.reshape((-1, 1, self.height, self.width))
+        x_p,z = self.cae(train_x)
+        x_p = x_p.cpu().detach().numpy()
+        x_p = x_p.reshape(-1, self.height*self.width)
         tsne = manifold.TSNE(n_components=2, init='pca', random_state=0)
-        t0 = time()
-        X_tsne = tsne.fit_transform(X)
+        X_tsne = tsne.fit_transform(x_p)
+
         print('plot embedding')
         plt.figure(figsize=(5,3.5))
         sns.scatterplot(
             x=X_tsne[:,0], y=X_tsne[:,1],
             hue=pred_label,
-            palette=sns.color_palette("hls", self.num_cluster),
+            palette=sns.color_palette("hls", len(set(pred_label))),
             legend="full"
         )
         plt.xlabel('TSNE 1')
         plt.ylabel('TSNE 2')
-    
+
+
